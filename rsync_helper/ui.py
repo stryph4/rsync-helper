@@ -201,21 +201,16 @@ def build_ui() -> tk.Tk:
     resume_check = tk.Checkbutton(controls_frame, text="Resume (keep partials)", variable=resume_var)
     resume_check.pack(side="left", padx=(0, 8))
 
-    def _start_cmd():
-        # Attach runtime options onto the callable so the runner picks them up
-        run_rsync_from_ui._resume = resume_var.get()
-        run_rsync_from_ui._progress_bar = progress_bar
-        run_rsync_from_ui._progress_label = progress_label
-        run_rsync_from_ui._call_with_attrs = True
-        run_rsync_from_ui(source_entry, dest_entry, log_text)
-
-    start_button = tk.Button(controls_frame, text="Start Rsync", command=_start_cmd)
-    start_button.pack(side="left", padx=(0, 8))
-
     progress_bar = ttk.Progressbar(controls_frame, orient="horizontal", mode="determinate")
     progress_bar.pack(fill="x", expand=True, side="left")
     progress_label = tk.Label(controls_frame, text="")
     progress_label.pack(side="right")
+
+    def _start_cmd():
+        run_rsync_from_ui(source_entry, dest_entry, log_text, resume=resume_var.get(), progress_bar=progress_bar, progress_label=progress_label)
+
+    start_button = tk.Button(controls_frame, text="Start Rsync", command=_start_cmd)
+    start_button.pack(side="left", padx=(0, 8))
 
     # Bottom actions frame (save log remains at bottom)
     actions_frame = tk.Frame(window)
@@ -284,12 +279,13 @@ def _run_rsync_thread(cmd, log_widget, progress_bar=None, progress_label=None, t
                     frac = min(1.0, done / float(total_files))
                     progress_bar['value'] = frac * 100
                     elapsed = time.time() - start_time
-                    if done > 0:
-                        remaining = elapsed * (total_files - done) / done
-                        mins, secs = divmod(int(remaining), 60)
-                        progress_label.config(text=f"{done}/{total_files} — ETA {mins}m{secs}s")
-                    else:
-                        progress_label.config(text=f"{done}/{total_files}")
+                    if progress_label:
+                        if done > 0:
+                            remaining = elapsed * (total_files - done) / done
+                            mins, secs = divmod(int(remaining), 60)
+                            progress_label.config(text=f"{done}/{total_files} — ETA {mins}m{secs}s")
+                        else:
+                            progress_label.config(text=f"{done}/{total_files}")
                 except Exception:
                     pass
 
@@ -300,22 +296,12 @@ def _run_rsync_thread(cmd, log_widget, progress_bar=None, progress_label=None, t
         messagebox.showinfo("rsync finished", "rsync completed successfully.")
 
 
-def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progress"):
+def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progress", resume=False, progress_bar=None, progress_label=None):
     src = src_entry.get().strip()
     dst = dst_entry.get().strip()
     if not src or not dst:
         messagebox.showwarning("Missing paths", "Please select both source and destination.")
         return
-    # Accept optional kwargs pushed through by the UI (resume checkbox,
-    # progress widgets). If the caller passed resume/resume_var/get,
-    # they need to forward them via kwargs — detect that pattern here.
-    # Extract optional parameters from callers via inspection of default
-    # attributes on this function call (workaround for lambda forwarding).
-    # For simplicity, allow callers to attach attributes to the function
-    # object before calling; otherwise these will be empty.
-    resume = getattr(run_rsync_from_ui, "_resume", False)
-    progress_bar = getattr(run_rsync_from_ui, "_progress_bar", None)
-    progress_label = getattr(run_rsync_from_ui, "_progress_label", None)
 
     # Build rsync options based on resume preference
     opts = shlex.split(extra_opts)
