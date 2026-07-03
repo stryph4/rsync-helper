@@ -16,6 +16,8 @@ import os
 from typing import Optional
 from tkinter import filedialog
 import traceback
+import shutil
+import subprocess
 
 from . import logger
 
@@ -34,25 +36,45 @@ LAST_GTK_ERROR: str | None = None
 
 
 DEFAULT_DIR = os.path.expanduser("~")
+DEFAULT_DIR = os.path.expanduser("~")
 
-    # Show a folder chooser and return the selected path or URI.
 
-    # Behavior:
-    # - If GTK is available, open a `Gtk.FileChooserDialog` and set the
-    #   current folder URI to `computer:///` so GNOME Files shows devices and
-    #   network locations.
-    # - If GTK is not available or the GTK dialog fails, fall back to
-    #   `tkinter.filedialog.askdirectory()`.
-
-    # Returns a filesystem path or a GVFS URI (string), or `None` if the
-    # user cancelled.
-    # 
-    # Only attempt GTK if the user explicitly opted in via env var. We do a
-    # lazy import here so the application can start safely on systems where
-    # GTK/PyGObject would otherwise cause a native crash when loaded.
 def choose_folder(title: str = "Select folder") -> Optional[str]:
+    """Show a folder chooser and return the selected path or URI.
+
+    Behavior:
+    - If GTK is available, open a `Gtk.FileChooserDialog` and set the
+      current folder URI to `computer:///` so GNOME Files shows devices and
+      network locations.
+    - If GTK is not available or the GTK dialog fails, fall back to
+      `tkinter.filedialog.askdirectory()`.
+
+    Returns a filesystem path or a GVFS URI (string), or `None` if the
+    user cancelled.
+
+    Only attempt GTK if the user explicitly opted in via env var. We do a
+    lazy import here so the application can start safely on systems where
+    GTK/PyGObject would otherwise cause a native crash when loaded.
+    """
 
     if USE_GTK:
+        # Prefer an external GTK-native dialog (zenity) to avoid loading
+        # PyGObject into this process and mixing GTK/Tk main loops which
+        # can cause the UI to freeze on some systems. Zenity runs as a
+        # separate process and returns the chosen path on stdout.
+        try:
+            if shutil.which("zenity"):
+                proc = subprocess.run([
+                    "zenity", "--file-selection", "--directory", "--title", title
+                ], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                out = proc.stdout.strip()
+                if out:
+                    return out
+                return None
+        except Exception:
+            # If zenity invocation fails, fall back to in-process GTK below
+            pass
+
         try:
             import gi  # type: ignore
             gi.require_version("Gtk", "3.0")
@@ -61,26 +83,44 @@ def choose_folder(title: str = "Select folder") -> Optional[str]:
             global Gtk, Gio
             Gtk, Gio = _Gtk, _Gio
 
-            dialog = Gtk.FileChooserDialog(
-                title=title,
-                action=Gtk.FileChooserAction.SELECT_FOLDER,
-                buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK),
-            )
+            dialog = Gtk.FileChooserDialog(title=title, action=Gtk.FileChooserAction.SELECT_FOLDER)
+            # Make dialog modal so responses are delivered reliably
+            try:
+                dialog.set_modal(True)
+            except Exception:
+                pass
+            # Explicitly add labeled buttons paired with response IDs
+            try:
+                dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+            except Exception:
+                # Fallback to legacy stock constants if add_buttons isn't available
+                try:
+                    dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+                except Exception:
+                    pass
+
             # Start at computer:/// to show "Other Locations" and devices
             dialog.set_current_folder_uri("computer:///")
-            resp = dialog.run()
-            if resp == Gtk.ResponseType.OK:
-                uri = dialog.get_uri()
-                # Try to obtain a local path for the URI; if not possible,
-                # return the original URI (useful for GVFS-mounted resources).
-                try:
-                    path = Gio.File.new_for_uri(uri).get_path()
-                except Exception:
-                    path = uri
+
+            try:
+                resp = dialog.run()
+                if resp == Gtk.ResponseType.OK:
+                    uri = dialog.get_uri()
+                    # Try to obtain a local path for the URI; if not possible,
+                    # return the original URI (useful for GVFS-mounted resources).
+                    try:
+                        path = Gio.File.new_for_uri(uri).get_path()
+                    except Exception:
+                        path = uri
+                    dialog.destroy()
+                    return path
                 dialog.destroy()
-                return path
-            dialog.destroy()
-            return None
+                return None
+            finally:
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
         except Exception:
             # If GTK import or dialog creation fails, log the traceback
             # so the user can diagnose why the native chooser failed.
@@ -119,25 +159,39 @@ def save_text_to_file(text: str, title: str = "Save file") -> Optional[str]:
             global Gtk
             Gtk = _Gtk
 
-            dialog = Gtk.FileChooserDialog(
-                title=title,
-                action=Gtk.FileChooserAction.SAVE,
-                buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK),
-            )
+            dialog = Gtk.FileChooserDialog(title=title, action=Gtk.FileChooserAction.SAVE)
+            try:
+                dialog.set_modal(True)
+            except Exception:
+                pass
+            try:
+                dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+            except Exception:
+                try:
+                    dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+                except Exception:
+                    pass
+
             dialog.set_do_overwrite_confirmation(True)
             dialog.set_current_name("rsync_helper.log")
             dialog.set_current_folder_uri(f"file://{DEFAULT_DIR}")
-            resp = dialog.run()
-            if resp == Gtk.ResponseType.OK:
-                filename = dialog.get_filename()
+
+            try:
+                resp = dialog.run()
+                if resp == Gtk.ResponseType.OK:
+                    filename = dialog.get_filename()
+                    try:
+                        with open(filename, "w", encoding="utf-8") as f:
+                            f.write(text)
+                    except Exception:
+                        raise
+                    return filename
+                return None
+            finally:
                 try:
-                    with open(filename, "w", encoding="utf-8") as f:
-                        f.write(text)
-                finally:
                     dialog.destroy()
-                return filename
-            dialog.destroy()
-            return None
+                except Exception:
+                    pass
         except Exception:
             # Fall back to tkinter below
             pass

@@ -12,10 +12,13 @@ from tkinter import messagebox
 
 from . import core
 from . import logger
+import os
 import shutil
 import subprocess
 import shlex
 import threading
+import time
+from tkinter import ttk
 
 
 def show_gtk_install_instructions_dialog(window: tk.Tk | tk.Toplevel):
@@ -190,9 +193,33 @@ def build_ui() -> tk.Tk:
     log_text.pack(fill="both", expand=True, padx=10, pady=(0, 6))
     logger.init(log_text)
 
-    # Bottom actions frame
+    # Controls under the browse buttons: resume, start and progress
+    controls_frame = tk.Frame(window)
+    controls_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+    resume_var = tk.BooleanVar(value=True)
+    resume_check = tk.Checkbutton(controls_frame, text="Resume (keep partials)", variable=resume_var)
+    resume_check.pack(side="left", padx=(0, 8))
+
+    def _start_cmd():
+        # Attach runtime options onto the callable so the runner picks them up
+        run_rsync_from_ui._resume = resume_var.get()
+        run_rsync_from_ui._progress_bar = progress_bar
+        run_rsync_from_ui._progress_label = progress_label
+        run_rsync_from_ui._call_with_attrs = True
+        run_rsync_from_ui(source_entry, dest_entry, log_text)
+
+    start_button = tk.Button(controls_frame, text="Start Rsync", command=_start_cmd)
+    start_button.pack(side="left", padx=(0, 8))
+
+    progress_bar = ttk.Progressbar(controls_frame, orient="horizontal", mode="determinate")
+    progress_bar.pack(fill="x", expand=True, side="left")
+    progress_label = tk.Label(controls_frame, text="")
+    progress_label.pack(side="right")
+
+    # Bottom actions frame (save log remains at bottom)
     actions_frame = tk.Frame(window)
-    actions_frame.pack(fill="x", padx=10, pady=(0, 10))
+    actions_frame.pack(fill="x", padx=10, pady=(6, 10))
 
     def on_save_log():
         """Save the current log contents to a file using the core helper.
@@ -223,12 +250,14 @@ def run_app():
     win.mainloop()
 
 
-def _run_rsync_thread(cmd, log_widget):
+def _run_rsync_thread(cmd, log_widget, progress_bar=None, progress_label=None, total_files=None):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     except FileNotFoundError:
         messagebox.showerror("rsync not found", "rsync is not installed on this system.")
         return
+    start_time = time.time()
+    done = 0
 
     for line in proc.stdout: # type: ignore
         line = line.rstrip()
@@ -245,6 +274,25 @@ def _run_rsync_thread(cmd, log_widget):
         except Exception:
             pass
 
+        # If rsync was run with --out-format=%n then lines that look like
+        # filenames indicate completed files; increment progress.
+        if progress_bar is not None and total_files:
+            # Heuristic: treat non-empty lines without leading spaces as file names
+            if line and not line[0].isspace():
+                done += 1
+                try:
+                    frac = min(1.0, done / float(total_files))
+                    progress_bar['value'] = frac * 100
+                    elapsed = time.time() - start_time
+                    if done > 0:
+                        remaining = elapsed * (total_files - done) / done
+                        mins, secs = divmod(int(remaining), 60)
+                        progress_label.config(text=f"{done}/{total_files} — ETA {mins}m{secs}s")
+                    else:
+                        progress_label.config(text=f"{done}/{total_files}")
+                except Exception:
+                    pass
+
     proc.wait()
     if proc.returncode != 0:
         messagebox.showerror("rsync failed", f"rsync exited with code {proc.returncode}")
@@ -258,8 +306,52 @@ def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progr
     if not src or not dst:
         messagebox.showwarning("Missing paths", "Please select both source and destination.")
         return
-    # build command
-    cmd = ["rsync"] + shlex.split(extra_opts) + [src, dst]
-    # run in background thread so UI stays responsive
-    t = threading.Thread(target=_run_rsync_thread, args=(cmd, log_widget), daemon=True)
-    t.start()
+    # Accept optional kwargs pushed through by the UI (resume checkbox,
+    # progress widgets). If the caller passed resume/resume_var/get,
+    # they need to forward them via kwargs — detect that pattern here.
+    # Extract optional parameters from callers via inspection of default
+    # attributes on this function call (workaround for lambda forwarding).
+    # For simplicity, allow callers to attach attributes to the function
+    # object before calling; otherwise these will be empty.
+    resume = getattr(run_rsync_from_ui, "_resume", False)
+    progress_bar = getattr(run_rsync_from_ui, "_progress_bar", None)
+    progress_label = getattr(run_rsync_from_ui, "_progress_label", None)
+
+    # Build rsync options based on resume preference
+    opts = shlex.split(extra_opts)
+    if resume:
+        # keep partial files and use append-verify for safer resumes
+        if "--partial" not in opts:
+            opts += ["--partial"]
+        if "--append-verify" not in opts:
+            opts += ["--append-verify"]
+
+    # Determine total files with a dry-run (runs quickly in most cases)
+    total_files = None
+
+    def count_and_run():
+        nonlocal total_files
+        try:
+            # Dry-run to get statistics
+            dry_cmd = ["rsync", "-a", "--dry-run", "--stats", src + ("/" if os.path.isdir(src) else ""), dst]
+            proc = subprocess.run(dry_cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            out = proc.stdout or ""
+            # look for a line like: "Number of files: 123"
+            for line in out.splitlines():
+                if "Number of files:" in line:
+                    try:
+                        total_files = int(line.split(":", 1)[1].strip())
+                    except Exception:
+                        total_files = None
+                    break
+        except Exception:
+            total_files = None
+
+        # build actual rsync command; request simple filename output for progress
+        cmd = ["rsync"] + opts + ["--out-format=%n", src, dst]
+        # run in background thread so UI stays responsive
+        t = threading.Thread(target=_run_rsync_thread, args=(cmd, log_widget, progress_bar, progress_label, total_files), daemon=True)
+        t.start()
+
+    # start counting and running in a thread so the UI doesn't lock
+    threading.Thread(target=count_and_run, daemon=True).start()

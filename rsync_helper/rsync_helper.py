@@ -97,11 +97,11 @@ if __name__ == "__main__":
             _logger = None
 
         for line in test_lines:
-            if _logger is not None:
-                try:
-                    _logger.log(line)
-                except Exception:
-                    pass
+                if _logger is not None:
+                    try:
+                        _logger.log(line)
+                    except Exception:
+                        pass
 
         if _logger is not None:
             try:
