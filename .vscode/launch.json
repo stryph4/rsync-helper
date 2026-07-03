@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug rsync_helper",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "rsync_helper.rsync_helper",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "env": {
+                "RSYNC_HELPER_USE_GTK": "1",
+                "GTK_MODULES": ""
+            },
+            "args": [],
+            "justMyCode": true
+        },
+        {
+            "name": "Attach to debug.sh",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "127.0.0.1",
+                "port": 5678
+            },
+            "justMyCode": true
+        }
+    ]
+}
