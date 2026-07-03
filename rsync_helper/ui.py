@@ -19,6 +19,8 @@ import shlex
 import threading
 import time
 from tkinter import ttk
+import traceback
+import re
 
 
 # A lightweight "rounded" button wrapper. True rounded corners require
@@ -297,58 +299,148 @@ def run_app():
     win.mainloop()
 
 
-def _run_rsync_thread(cmd, log_widget, progress_bar=None, progress_label=None, total_files=None):
+def _schedule(widget, fn):
+    """Schedule *fn* on the Tkinter main-loop thread via after(0, ...)."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except FileNotFoundError:
-        messagebox.showerror("rsync not found", "rsync is not installed on this system.")
-        return
-    start_time = time.time()
-    done = 0
+        widget.after(0, fn)
+    except Exception:
+        pass
 
-    for line in proc.stdout: # type: ignore
-        line = line.rstrip()
-        try:
-            # add to any project logger if available
+
+def _run_rsync_thread(cmd, log_widget, progress_bar=None, progress_label=None, total_files=None, total_bytes=None):
+    """Run rsync in a thread, parsing progress2 output for a smooth progress bar.
+
+    Reads stdout in bytes mode, splitting on both \\r and \\n so that
+    rsync's carriage-return-based progress lines are handled correctly.
+    All Tkinter widget updates are scheduled on the main thread via after().
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,  # unbuffered for low-latency progress updates
+        )
+    except FileNotFoundError:
+        _schedule(log_widget, lambda: messagebox.showerror(
+            "rsync not found", "rsync is not installed on this system."
+        ))
+        return
+
+    buf = b""
+
+    def _handle_line(raw: bytes) -> None:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            return
+
+        # Log to stdout (safe from any thread) and schedule widget append.
+        print(line)
+
+        def _append(l=line):
             try:
-                from . import logger
-                logger.log(line)
+                log_widget.configure(state="normal")
+                log_widget.insert(tk.END, l + "\n")
+                log_widget.see(tk.END)
+                log_widget.configure(state="disabled")
             except Exception:
                 pass
-            # append to UI log widget
-            log_widget.insert(tk.END, line + "\n")
-            log_widget.see(tk.END)
+        _schedule(log_widget, _append)
+
+        # ---- Progress parsing ------------------------------------------------
+        # --info=progress2 lines look like:
+        #   "   102,400  10%  1.23MB/s    0:00:00 (xfr#1, to-chk=3/5)"
+        # The % is the *current file's* byte progress; to-chk=M/N tells us
+        # how many files are left out of the total.  We blend both for a
+        # hybrid bar that advances smoothly within a file AND across files.
+        if progress_bar is None:
+            return
+        m = re.search(r"(\d+)%.*?to-chk=(\d+)/(\d+)", line)
+        if not m:
+            return
+        try:
+            file_byte_pct = int(m.group(1))          # % of *current* file
+            files_remaining = int(m.group(2))
+            files_total = int(m.group(3))
+            if files_total <= 0:
+                return
+            # Files fully completed so far (the current one is in-progress)
+            files_done = files_total - files_remaining - 1
+            # Fraction: completed files + partial credit for current file
+            file_frac = (files_done + file_byte_pct / 100.0) / files_total
+            hybrid_pct = min(99.0, file_frac * 100)  # cap at 99 until rsync exits cleanly
+            label = f"{max(0, files_done + 1)}/{files_total} files — {file_byte_pct}%"
+
+            def _upd(pct=hybrid_pct, txt=label):
+                try:
+                    progress_bar.configure(value=pct)
+                    if progress_label:
+                        progress_label.config(text=txt)
+                except Exception:
+                    pass
+            _schedule(log_widget, _upd)
         except Exception:
             pass
 
-        # If rsync was run with --out-format=%n then lines that look like
-        # filenames indicate completed files; increment progress.
-        if progress_bar is not None and total_files:
-            # Heuristic: treat non-empty lines without leading spaces as file names
-            if line and not line[0].isspace():
-                done += 1
-                try:
-                    frac = min(1.0, done / float(total_files))
-                    progress_bar['value'] = frac * 100
-                    elapsed = time.time() - start_time
-                    if progress_label:
-                        if done > 0:
-                            remaining = elapsed * (total_files - done) / done
-                            mins, secs = divmod(int(remaining), 60)
-                            progress_label.config(text=f"{done}/{total_files} — ETA {mins}m{secs}s")
-                        else:
-                            progress_label.config(text=f"{done}/{total_files}")
-                except Exception:
-                    pass
+    # Read output splitting on both \r and \n so progress2 carriage-return
+    # lines are treated as separate events.
+    while True:
+        chunk = proc.stdout.read(4096)  # type: ignore[union-attr]
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            cr = buf.find(b"\r")
+            if nl == -1 and cr == -1:
+                break
+            if nl == -1:
+                idx = cr
+            elif cr == -1:
+                idx = nl
+            else:
+                idx = min(nl, cr)
+            _handle_line(buf[:idx])
+            buf = buf[idx + 1:]
+    if buf:
+        _handle_line(buf)
 
     proc.wait()
+
     if proc.returncode != 0:
-        messagebox.showerror("rsync failed", f"rsync exited with code {proc.returncode}")
+        _schedule(log_widget, lambda: messagebox.showerror(
+            "rsync failed", f"rsync exited with code {proc.returncode}"
+        ))
     else:
-        messagebox.showinfo("rsync finished", "rsync completed successfully.")
+        # Fill to 100 % on clean exit
+        def _done():
+            try:
+                if progress_bar:
+                    progress_bar.configure(value=100)
+                if progress_label:
+                    progress_label.config(text="Done")
+            except Exception:
+                pass
+        _schedule(log_widget, _done)
+
+        # Flush OS write caches — safe to do on this thread.
+        try:
+            logger.log("Flushing OS write cache (sync)...")
+            subprocess.run(["sync"], check=True)
+            logger.log("Write cache flushed to disk.")
+        except subprocess.CalledProcessError:
+            logger.log("Failed to flush write cache (CalledProcessError):")
+            logger.log(traceback.format_exc())
+        except Exception:
+            logger.log("Error flushing write cache:")
+            logger.log(traceback.format_exc())
+
+        _schedule(log_widget, lambda: messagebox.showinfo(
+            "rsync finished", "rsync completed successfully."
+        ))
 
 
-def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progress", resume=False, progress_bar=None, progress_label=None):
+def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-ah --fsync --info=progress2", resume=False, progress_bar=None, progress_label=None):
     src = src_entry.get().strip()
     dst = dst_entry.get().strip()
     if not src or not dst:
@@ -366,9 +458,10 @@ def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progr
 
     # Determine total files with a dry-run (runs quickly in most cases)
     total_files = None
+    total_bytes = None
 
     def count_and_run():
-        nonlocal total_files
+        nonlocal total_files, total_bytes
         try:
             # Dry-run to get statistics
             dry_cmd = ["rsync", "-a", "--dry-run", "--stats", src + ("/" if os.path.isdir(src) else ""), dst]
@@ -376,19 +469,28 @@ def run_rsync_from_ui(src_entry, dst_entry, log_widget, extra_opts="-avh --progr
             out = proc.stdout or ""
             # look for a line like: "Number of files: 123"
             for line in out.splitlines():
-                if "Number of files:" in line:
-                    try:
-                        total_files = int(line.split(":", 1)[1].strip())
-                    except Exception:
-                        total_files = None
-                    break
+                    if "Number of files:" in line:
+                        try:
+                            total_files = int(line.split(":", 1)[1].strip())
+                        except Exception:
+                            total_files = None
+                    # rsync --stats prints total file size as: "Total file size: 12345"
+                    if "Total file size:" in line:
+                        try:
+                            val = line.split(":", 1)[1].strip()
+                            # remove commas
+                            val = val.replace(",", "")
+                            total_bytes = int(val)
+                        except Exception:
+                            total_bytes = None
         except Exception:
             total_files = None
 
-        # build actual rsync command; request simple filename output for progress
-        cmd = ["rsync"] + opts + ["--out-format=%n", src, dst]
+        # --info=progress2 already provides per-file byte % and to-chk=M/N
+        # for file-count progress; --out-format is not needed.
+        cmd = ["rsync"] + opts + [src, dst]
         # run in background thread so UI stays responsive
-        t = threading.Thread(target=_run_rsync_thread, args=(cmd, log_widget, progress_bar, progress_label, total_files), daemon=True)
+        t = threading.Thread(target=_run_rsync_thread, args=(cmd, log_widget, progress_bar, progress_label, total_files, total_bytes), daemon=True)
         t.start()
 
     # start counting and running in a thread so the UI doesn't lock

@@ -9,9 +9,11 @@ written to stdout.
 
 from datetime import datetime
 import tkinter as tk
+from typing import Optional
 
 # Internal widget where log lines are written. If None, fallback to stdout.
-_widget: tk.Text | None = None
+# Use `Optional` for compatibility with Python <3.10.
+_widget: Optional[tk.Text] = None
 
 
 def init(widget: tk.Text) -> None:
